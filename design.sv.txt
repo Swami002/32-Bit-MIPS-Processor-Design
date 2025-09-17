@@ -1,0 +1,189 @@
+module MIPS32 (input clk, reset);
+    wire [31:0] pc, next_pc, instr;
+    wire [4:0] rs, rt, rd, shamt;
+    wire [5:0] funct, opcode;
+    wire [15:0] imm16;
+    wire [25:0] jaddr;
+
+    // Control signals
+    wire RegDst, ALUSrc, MemtoReg, RegWrite, MemRead, MemWrite, Branch, Jump;
+    wire [1:0] ALUOp;
+    wire [3:0] ALUCtrl;
+
+    // Register file connections
+    wire [31:0] rd1, rd2, wd, alu_in2, alu_out, mem_out, se_imm, pc_plus4, branch_addr, jump_addr;
+    wire zero;
+
+    assign opcode = instr[31:26];
+    assign rs     = instr[25:21];
+    assign rt     = instr[20:16];
+    assign rd     = instr[15:11];
+    assign shamt  = instr[10:6];
+    assign funct  = instr[5:0];
+    assign imm16  = instr[15:0];
+    assign jaddr  = instr[25:0];
+
+    // PC
+    PC pc_reg(clk, reset, next_pc, pc);
+
+    // Instruction Memory
+    InstrMem imem(pc[9:2], instr);
+
+    // Register File
+    wire [4:0] wreg = (RegDst) ? rd : rt;
+    RegFile rf(clk, RegWrite, rs, rt, wreg, wd, rd1, rd2);
+
+    // Sign extend
+    assign se_imm = {{16{imm16[15]}}, imm16};
+
+    // ALU input
+    assign alu_in2 = (ALUSrc) ? se_imm : rd2;
+
+    // ALU control
+    ALUControl alu_ctrl(ALUOp, funct, ALUCtrl);
+
+    // ALU
+    ALU alu(rd1, alu_in2, ALUCtrl, alu_out, zero);
+
+    // Data memory
+    DataMem dmem(clk, MemRead, MemWrite, alu_out, rd2, mem_out);
+
+    // Write back mux
+    assign wd = (MemtoReg) ? mem_out : alu_out;
+
+    // PC calculation
+    assign pc_plus4   = pc + 4;
+    assign branch_addr = pc_plus4 + (se_imm << 2);
+    assign jump_addr   = {pc_plus4[31:28], jaddr, 2'b00};
+
+    assign next_pc = (Jump) ? jump_addr :
+                     (Branch & zero) ? branch_addr : pc_plus4;
+
+    // Control Unit
+  ControlUnit cu(opcode, RegDst, ALUSrc, MemtoReg, RegWrite, MemRead, MemWrite, Branch, Jump, ALUOp);
+
+endmodule
+
+// PC Reg
+module PC(input clk, reset,
+          input [31:0] next_pc,
+          output reg [31:0] pc);
+    always @(posedge clk or posedge reset) begin
+        if (reset) pc <= 0;
+        else pc <= next_pc;
+    end
+endmodule
+
+// Instruction Memory
+module InstrMem(input [7:0] addr, output [31:0] instr);
+    reg [31:0] memory[0:255];
+    initial begin
+        memory[0] = 32'h20080005; // addi $t0, $zero, 5
+        memory[1] = 32'h20090003; // addi $t1, $zero, 3
+        memory[2] = 32'h01095020; // add  $t2, $t0, $t1
+        memory[3] = 32'h012A5822; // sub  $t3, $t1, $t2
+        memory[4] = 32'h00000000; // nop
+    end
+    assign instr = memory[addr];
+endmodule
+
+// Register files
+module RegFile(input clk, RegWrite,
+               input [4:0] rs, rt, rd,
+               input [31:0] wd,
+               output [31:0] rd1, rd2);
+    reg [31:0] regfile[0:31];
+    assign rd1 = regfile[rs];
+    assign rd2 = regfile[rt];
+    always @(posedge clk) begin
+        if (RegWrite && rd != 0)
+            regfile[rd] <= wd;
+    end
+endmodule
+
+// Data Memory
+module DataMem(input clk, MemRead, MemWrite,
+               input [31:0] addr, wd,
+               output [31:0] rd);
+    reg [31:0] memory[0:255];
+    assign rd = (MemRead) ? memory[addr[9:2]] : 32'b0;
+    always @(posedge clk) begin
+        if (MemWrite)
+            memory[addr[9:2]] <= wd;
+    end
+endmodule
+
+// ALU
+module ALU(input [31:0] a, b,
+           input [3:0] alu_ctrl,
+           output reg [31:0] result,
+           output zero);
+    always @(*) begin
+        case (alu_ctrl)
+            4'b0010: result = a + b;    // add
+            4'b0110: result = a - b;    // sub
+            4'b0000: result = a & b;    // and
+            4'b0001: result = a | b;    // or
+            4'b0111: result = (a < b) ? 1 : 0; // slt
+            default: result = 0;
+        endcase
+    end
+    assign zero = (result == 0);
+endmodule
+
+// Control Unit
+module ControlUnit(input [5:0] opcode,
+    output reg RegDst, ALUSrc, MemtoReg, RegWrite,
+    output reg MemRead, MemWrite, Branch, Jump,
+    output reg [1:0] ALUOp);
+    always @(*) begin
+        case (opcode)
+            6'b000000: begin // R-type
+                RegDst=1; ALUSrc=0; MemtoReg=0; RegWrite=1;
+                MemRead=0; MemWrite=0; Branch=0; Jump=0; ALUOp=2'b10;
+            end
+            6'b100011: begin // lw
+                RegDst=0; ALUSrc=1; MemtoReg=1; RegWrite=1;
+                MemRead=1; MemWrite=0; Branch=0; Jump=0; ALUOp=2'b00;
+            end
+            6'b101011: begin // sw
+                RegDst=0; ALUSrc=1; MemtoReg=0; RegWrite=0;
+                MemRead=0; MemWrite=1; Branch=0; Jump=0; ALUOp=2'b00;
+            end
+            6'b000100: begin // beq
+                RegDst=0; ALUSrc=0; MemtoReg=0; RegWrite=0;
+                MemRead=0; MemWrite=0; Branch=1; Jump=0; ALUOp=2'b01;
+            end
+            6'b000010: begin // j
+                RegDst=0; ALUSrc=0; MemtoReg=0; RegWrite=0;
+                MemRead=0; MemWrite=0; Branch=0; Jump=1; ALUOp=2'b00;
+            end
+            default: begin
+                RegDst=0; ALUSrc=0; MemtoReg=0; RegWrite=0;
+                MemRead=0; MemWrite=0; Branch=0; Jump=0; ALUOp=2'b00;
+            end
+        endcase
+    end
+endmodule
+
+// ALU Control
+module ALUControl(input [1:0] ALUOp, input [5:0] funct,
+                  output reg [3:0] alu_ctrl);
+    always @(*) begin
+        case (ALUOp)
+            2'b00: alu_ctrl = 4'b0010; // add
+            2'b01: alu_ctrl = 4'b0110; // sub
+            2'b10: begin
+                case (funct)
+                    6'b100000: alu_ctrl = 4'b0010; // add
+                    6'b100010: alu_ctrl = 4'b0110; // sub
+                    6'b100100: alu_ctrl = 4'b0000; // and
+                    6'b100101: alu_ctrl = 4'b0001; // or
+                    6'b101010: alu_ctrl = 4'b0111; // slt
+                    default:   alu_ctrl = 4'b0000;
+                endcase
+            end
+            default: alu_ctrl = 4'b0000;
+        endcase
+    end
+endmodule
